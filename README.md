@@ -55,10 +55,14 @@ python main.py
 Use command-line arguments for additional options:
 - `-v` or `--verbose`: Increase output verbosity
 - `-c` or `--config`: Specify a custom config file path
+- `--disable-slack`: Disable Slack alerts
+- `-i` or `--interval`: Set the monitoring interval in minutes (default: 5)
+- `--run-once`: Run the monitoring once and exit
+- `--print-to-terminal`: Print alerts to terminal
 
 Example:
 ```bash
-python main.py -v -c /path/to/custom/config.ini
+python main.py -v -c /path/to/custom/config.ini --interval 10 --print-to-terminal
 ```
 
 ### 2. As a Systemd Service
