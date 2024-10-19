@@ -49,6 +49,10 @@ async def send_slack_message_async(msg: str, webhook: str):
     :param webhook: The Slack webhook URL
     :return: None
     """
+    if not webhook:
+        logging.error("Slack webhook URL is not set. Cannot send Slack message.")
+        return
+
     data = {"text": msg, "response_type": "in_channel"}
     headers = {"Content-Type": "application/json"}
     

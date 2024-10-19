@@ -1,4 +1,5 @@
 Pipfile.lock
+local_config.ini
 
 # Python cache files
 __pycache__/
@@ -40,7 +41,6 @@ htmlcov/
 .pytest_cache/
 
 # Configuration files (be cautious with this, you might want to track some config files)
-*.ini
 *.conf
 
 # Temporary files

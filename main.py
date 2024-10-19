@@ -4,27 +4,40 @@ import subprocess
 import time
 import re
 import configparser
-import logging
 import os
-from systemd import journal
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+from systemd import journal as systemd_journal
 import argparse
 from integrations.send_email import send_email
 from integrations.send_slack import send_slack_message
+from logging_setup import setup_logging
+from cysystemd.reader import JournalReader, JournalOpenMode
+import signal
+import sys
+from datetime import datetime, timedelta
+import psutil
+import pytz
 
+# Add this line near the top of the file, after imports
+global config
+
+# Add this global variable near the top of the file
+cpu_high_load_start_time = None
+
+# Add these global variables near the top of the file
+last_disk_usage_report = {}
+last_high_memory_report_time = None
 def parse_arguments():
     parser = argparse.ArgumentParser(description="System Monitoring Service")
     parser.add_argument("-v", "--verbose", action="store_true", help="Increase output verbosity")
     parser.add_argument("-c", "--config", default="/etc/system_monitor/config.ini", help="Path to configuration file")
+    parser.add_argument("--disable-slack", action="store_true", help="Disable Slack alerts")
+    parser.add_argument("-i", "--interval", type=int, default=5, help="Monitoring interval in minutes")
+    parser.add_argument("--run-once", action="store_true", help="Run the monitoring once and exit")
+    parser.add_argument("--print-to-terminal", action="store_true", help="Print alerts to terminal")
     return parser.parse_args()
 
-def setup_logging(verbose):
-    log_level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
-
 def load_config(config_path):
+    global config
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
     
@@ -32,63 +45,77 @@ def load_config(config_path):
     config.read(config_path)
     return config
 
-# Load configuration
-config = load_config('/etc/system_monitor/config.ini')
-
-# Setup logging
-LOG_FILE = config.get('General', 'LogFile')
-LOG_LEVEL = getattr(logging, config.get('General', 'LogLevel', fallback='INFO'))
-logging.basicConfig(filename=LOG_FILE, level=LOG_LEVEL, format='%(asctime)s %(levelname)s: %(message)s')
-
-# Load other configurations
-ADMIN_EMAIL = config.get('Alerting', 'AdminEmail')
-SMTP_SERVER = config.get('Alerting', 'SMTPServer')
-SMTP_PORT = config.getint('Alerting', 'SMTPPort')
-SMTP_USERNAME = config.get('Alerting', 'SMTPUsername')
-SMTP_PASSWORD = config.get('Alerting', 'SMTPPassword')
-
-DISK_USAGE_WARNING = config.getint('Thresholds', 'DiskUsageWarning')
-DISK_USAGE_CRITICAL = config.getint('Thresholds', 'DiskUsageCritical')
-CPU_USAGE_THRESHOLD = config.getint('Thresholds', 'CPUUsageThreshold')
-MEMORY_USAGE_THRESHOLD = config.getint('Thresholds', 'MemoryUsageThreshold')
-
-MONITORING_INTERVAL = config.getint('Monitoring', 'MonitoringInterval')
-
-# Report to Admin Function
-async def report_to_admin(config, subject, message):
-    if config.getboolean('Alerting', 'EnableEmailAlerts'):
-        await send_email(config, subject, message)
+# Main Daemon Function
+def main(config, interval_minutes, disable_slack, print_to_terminal):
+    logger.info("System Monitor Service Started")
+    monitor_disk_space(config, disable_slack, print_to_terminal)
+    monitor_high_cpu_memory(config, disable_slack, print_to_terminal)
+    monitor_journal_events(config, interval_minutes, disable_slack, print_to_terminal)
+    #monitor_service_unit_changes(config, disable_slack, print_to_terminal)
     
-    if config.getboolean('Alerting', 'EnableSlackAlerts'):
-        slack_webhook_url = config.get('SlackConfig', 'SlackWebhookURL')
-        await send_slack_message(f"{subject}: {message}", slack_webhook_url)
+# Report to Admin Function
+def report_to_admin(config, subject="NONE", message="error, message missing", disable_slack=False, print_to_terminal=False):
+    tasks = []
+    if config.getboolean('Alerting', 'EnableEmailAlerts', fallback=False):
+        tasks.append(send_email(config, subject, message))
+    
+    if not disable_slack and config.getboolean('Alerting', 'EnableSlackAlerts', fallback=False):
+        slack_webhook_url = config.get('SlackConfig', 'SlackWebhookURL', fallback='').strip("'")
+        if slack_webhook_url:
+            tasks.append(send_slack_message(f"{subject}: {message}", slack_webhook_url))
+        else:
+            logger.error("Slack webhook URL is not set in the configuration.")
+    
+    for task in tasks:
+        task()
+    
+    if print_to_terminal:
+        print(f"ALERT - {subject}: {message}")
 
 # Monitoring Functions
-async def monitor_disk_space(config):
+def monitor_disk_space(config, disable_slack, print_to_terminal):
     if not config.getboolean('Monitoring', 'EnableDiskSpaceMonitoring'):
         return
+    
+    global last_disk_usage_report
+    current_time = datetime.now()
+    
     try:
-        proc = await asyncio.create_subprocess_exec(
-            'df', '-h', stdout=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
-        lines = stdout.decode().splitlines()
+        result = subprocess.run(['df', '-h'], text=True, capture_output=True, check=True)
+        lines = result.stdout.splitlines()
         for line in lines[1:]:
             parts = re.split(r'\s+', line)
             usage_percent = int(parts[4].replace('%', ''))
-            if usage_percent >= config.getint('Thresholds', 'DiskUsageCritical'):
-                await report_to_admin(config, "Critical Disk Usage Alert", f"Disk usage at {usage_percent}% on {parts[0]}")
-            elif usage_percent >= config.getint('Thresholds', 'DiskUsageWarning'):
-                await report_to_admin(config, "Warning Disk Usage Alert", f"Disk usage at {usage_percent}% on {parts[0]}")
+            disk_usage_critical = config.getint('Thresholds', 'DiskUsageCritical', fallback=90)
+            disk_usage_warning = config.getint('Thresholds', 'DiskUsageWarning', fallback=80)
+            
+            if usage_percent >= disk_usage_critical:
+                report_level = "Critical"
+            elif usage_percent >= disk_usage_warning:
+                report_level = "Warning"
+            else:
+                continue
+            
+            disk = parts[0]
+            if disk not in last_disk_usage_report or current_time - last_disk_usage_report[disk] > timedelta(days=1):
+                report_to_admin(config, f"{report_level} Disk Usage Alert", f"Disk usage at {usage_percent}% on {disk}", disable_slack, print_to_terminal)
+                last_disk_usage_report[disk] = current_time
+            
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Subprocess error: {e.returncode}, {e.output}")
+    except ValueError as e:
+        logger.error(f"Value error: {str(e)} - Check disk usage parsing logic.")
+    except IndexError as e:
+        logger.error(f"Index error: {str(e)} - Check line parsing logic.")
     except Exception as e:
-        logging.error(f"Error monitoring disk space: {str(e)}")
+        logger.warning(f"Unexpected error: {str(e)}")
 
-async def monitor_journal_events(config):
+def monitor_journal_events(config, interval_minutes, disable_slack, print_to_terminal):
     if not config.getboolean('Monitoring', 'EnableJournalMonitoring'):
         return
     keywords = config.get('JournalMonitoring', 'Keywords').split(',')
     event_types = {
-        'reboot': ('System Reboot/Shutdown Detected', lambda m: any(kw in m for kw in keywords)),
+        #'reboot': ('System Reboot/Shutdown Detected', lambda m: any(kw in m for kw in keywords)),
         'oom-killer': ('Out of Memory Event Detected', lambda m: 'oom-killer' in m),
         'hardware error': ('Hardware Issue Detected', lambda m: 'hardware error' in m),
         'network': ('Network Issue Detected', lambda m: 'network' in m and 'failed' in m),
@@ -102,104 +129,159 @@ async def monitor_journal_events(config):
         'dependency failed': ('Unit Dependency Failure Detected', lambda m: 'dependency failed' in m),
         'time sync': ('Time Synchronization Failure Detected', lambda m: 'time sync' in m and 'failed' in m),
         'power': ('Power Event Detected', lambda m: 'power' in m),
+        'connection': ('Connection Event Detected', lambda m: 'connection' in m.lower() or 'login' in m.lower() or 'connected' in m.lower() or 'disconnected' in m.lower()),
     }
     try:
-        j = journal.Reader()
-        j.log_level(journal.LOG_INFO)
-        j.seek_tail()
-        j.get_previous()
-        j.seek_tail()
+        journal_reader = JournalReader()
+        journal_reader.open(JournalOpenMode.SYSTEM)
+        
+        # Seek to entries from the last interval
+        interval_ago = datetime.now(tz=pytz.UTC) - timedelta(minutes=interval_minutes)
+        journal_reader.seek_realtime_usec(int(interval_ago.timestamp() * 1000000))
 
-        while True:
-            j.wait(1000)
-            for entry in j:
-                if 'MESSAGE' in entry:
-                    message = entry['MESSAGE'].lower()
-                    for event_type, (subject, condition) in event_types.items():
-                        if condition(message):
-                            await report_to_admin(config, subject, message)
-                            break
+        for record in journal_reader:
+            entry_time = record.date.replace(tzinfo=pytz.UTC)
+            if entry_time < interval_ago:
+                continue
+            #print(record.data['MESSAGE'])
+
+            if 'MESSAGE' in record.data:
+                message = record.data['MESSAGE'].lower()
+                for event_type, (subject, condition) in event_types.items():
+                    if condition(message):
+                        report_to_admin(config, subject, message, disable_slack, print_to_terminal)
+                        break
     except Exception as e:
-        logging.error(f"Error monitoring journal events: {str(e)}")
+        logger.warning(f"Error monitoring journal events: {str(e)}")
 
-async def monitor_high_cpu_memory(config):
+def monitor_high_cpu_memory(config, disable_slack, print_to_terminal):
     if not config.getboolean('Monitoring', 'EnableCPUMemoryMonitoring'):
         return
+    
+    global cpu_high_load_start_time, last_high_memory_report_time
+    cpu_threshold = 90  # Set threshold to 90%
+    duration_threshold = 2 * 60 * 60  # 2 hours in seconds
+    
     try:
-        proc = await asyncio.create_subprocess_exec(
-            'ps', '-eo', 'pid,ppid,cmd,%mem,%cpu', '--sort=-%cpu',
-            stdout=asyncio.subprocess.PIPE
+        proc = subprocess.run(
+            ['ps', '-eo', 'pid,ppid,cmd,%mem,%cpu', '--sort=-%cpu'],
+            capture_output=True, text=True
         )
-        stdout, _ = await proc.communicate()
-        lines = stdout.decode().splitlines()
-        for line in lines[1:5]:  # Check top 5 CPU consumers
-            parts = re.split(r'\s+', line)
-            cpu_usage = float(parts[-1])
-            if cpu_usage > config.getfloat('Thresholds', 'CPUUsageThreshold'):
-                await report_to_admin(config, "High CPU Usage Alert", f"Process {parts[2]} is using {cpu_usage}% CPU")
-    except Exception as e:
-        logging.error(f"Error monitoring CPU/memory usage: {str(e)}")
+        lines = proc.stdout.splitlines()
+        total_cpu_usage = sum(float(line.split()[-1]) for line in lines[1:])
+        
+        current_time = time.time()
+        
+        if total_cpu_usage > cpu_threshold:
+            if cpu_high_load_start_time is None:
+                cpu_high_load_start_time = current_time
+            elif current_time - cpu_high_load_start_time > duration_threshold:
+                report_to_admin(config, "Sustained High CPU Usage Alert", 
+                                f"Total CPU usage has been above {cpu_threshold}% for over 2 hours. Current usage: {total_cpu_usage:.2f}%",
+                                disable_slack, print_to_terminal)
+        else:
+            cpu_high_load_start_time = None
 
-async def monitor_service_unit_changes(config):
+        memory = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        total_memory = memory.total + swap.total
+        used_memory = memory.used + swap.used
+        total_memory_percent = (used_memory / total_memory) * 100
+        swap_percent = swap.percent
+
+        memory_threshold = config.getint('Thresholds', 'MemoryUsageThreshold', fallback=90)
+        swap_threshold = config.getint('Thresholds', 'SwapUsageThreshold', fallback=85)
+
+        current_datetime = datetime.now()
+        if (total_memory_percent >= memory_threshold or swap_percent >= swap_threshold) and \
+           (last_high_memory_report_time is None or current_datetime - last_high_memory_report_time > timedelta(hours=1)):
+            message = f"High memory usage detected. Total memory (including swap) usage: {total_memory_percent:.2f}%, Swap usage: {swap_percent:.2f}%"
+            report_to_admin(config, "High Memory Usage Alert", message, disable_slack, print_to_terminal)
+            last_high_memory_report_time = current_datetime
+
+    except Exception as e:
+        logger.error(f"Error monitoring CPU/memory usage: {str(e)}")
+
+def monitor_service_unit_changes(config, disable_slack, print_to_terminal):
     if not config.getboolean('Monitoring', 'EnableServiceUnitMonitoring'):
         return
     service_unit_path = config.get('ServiceUnitMonitoring', 'ServiceUnitPath')
+    if not os.path.isdir(service_unit_path):
+        logger.error(f"Service unit directory not found: {service_unit_path}")
+        return
     check_interval = config.getint('ServiceUnitMonitoring', 'ServiceUnitCheckInterval')
+    
     try:
-        async with aiofiles.open(service_unit_path, mode='r') as file:
-            initial_content = await file.read()
+        initial_state = {}
+        for filename in os.listdir(service_unit_path):
+            if filename.endswith('.service'):
+                file_path = os.path.join(service_unit_path, filename)
+                initial_state[filename] = os.path.getmtime(file_path)
         
         while True:
-            await asyncio.sleep(check_interval)  # Check every minute
-            async with aiofiles.open(service_unit_path, mode='r') as file:
-                current_content = await file.read()
-            
-            if current_content != initial_content:
-                await report_to_admin(config, "Service Unit File Change Detected", "A change in service unit files has been detected.")
-                initial_content = current_content
+            sleep(check_interval)
+            for filename in os.listdir(service_unit_path):
+                if filename.endswith('.service'):
+                    file_path = os.path.join(service_unit_path, filename)
+                    current_mtime = os.path.getmtime(file_path)
+                    if filename not in initial_state or current_mtime != initial_state[filename]:
+                        report_to_admin(config, "Service Unit File Change Detected", f"Change detected in {filename}", disable_slack, print_to_terminal)
+                        initial_state[filename] = current_mtime
     except Exception as e:
-        logging.error(f"Error monitoring service unit changes: {str(e)}")
+        logger.error(f"Error monitoring service unit changes: {str(e)}")
 
-# Main Daemon Function
-async def main(config):
-    logging.info("System Monitor Service Started")
-    monitoring_tasks = [
-        monitor_disk_space(config),
-        monitor_high_cpu_memory(config),
-        monitor_journal_events(config),
-        monitor_service_unit_changes(config)
-    ]
-    await asyncio.gather(*monitoring_tasks)
+def handle_exit_signal(signum, frame):
+    logger.info("Exiting System Monitor Service...")
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, handle_exit_signal)
+signal.signal(signal.SIGTERM, handle_exit_signal)
 
 if __name__ == "__main__":
     args = parse_arguments()
-    setup_logging(args.verbose)
     
     try:
         config = load_config(args.config)
         
-        # Fork the process (daemon creation code remains the same)
-        try:
-            pid = os.fork()
-            if pid > 0:
-                exit(0)  # Parent process exits
-        except OSError as e:
-            logging.error(f"Fork failed: {e.errno} ({e.strerror})")
-            exit(1)
+        # Setup logging
+        logger = setup_logging(
+            log_file=config.get('Logging', 'LogFile', fallback='/var/log/system_monitor.log'),
+            max_size=config.getint('Logging', 'MaxLogSize', fallback=10*1024*1024),
+            backup_count=config.getint('Logging', 'BackupCount', fallback=5),
+            disable_slack=args.disable_slack
+        )
+        
+        # Load other configurations
+        ADMIN_EMAIL = config.get('EmailConfig', 'AdminEmail', fallback='')
+        SMTP_SERVER = config.get('EmailConfig', 'SMTPServer', fallback='localhost')
+        SMTP_PORT = config.getint('EmailConfig', 'SMTPPort', fallback=25)
+        SMTP_USERNAME = config.get('EmailConfig', 'SMTPUsername', fallback='')
+        SMTP_PASSWORD = config.get('EmailConfig', 'SMTPPassword', fallback='')
 
-        os.setsid()
-        os.umask(0)
+        DISK_USAGE_WARNING = config.getint('Thresholds', 'DiskUsageWarning', fallback=80)
+        DISK_USAGE_CRITICAL = config.getint('Thresholds', 'DiskUsageCritical', fallback=90)
+        CPU_USAGE_THRESHOLD = config.getint('Thresholds', 'CPUUsageThreshold', fallback=80)
+        MEMORY_USAGE_THRESHOLD = config.getint('Thresholds', 'MemoryUsageThreshold', fallback=80)
 
-        try:
-            pid = os.fork()
-            if pid > 0:
-                exit(0)  # Second parent exits
-        except OSError as e:
-            logging.error(f"Fork failed: {e.errno} ({e.strerror})")
-            exit(1)
+        MONITORING_INTERVAL = config.getint('Monitoring', 'MonitoringInterval', fallback=60)
 
-        # Start monitoring
-        asyncio.run(main(config))
+        # Load Slack webhook URL
+        slack_webhook_url = config.get('SlackConfig', 'SlackWebhookURL', fallback='').strip("'")
+        if not slack_webhook_url and config.getboolean('Alerting', 'EnableSlackAlerts', fallback=False) and not args.disable_slack:
+            logger.error("Slack alerts are enabled, but Slack webhook URL is not set in the configuration.")
+
+        # Register signal handlers
+        signal.signal(signal.SIGINT, handle_exit_signal)
+        signal.signal(signal.SIGTERM, handle_exit_signal)
+        
+        if args.run_once:
+            main(config, MONITORING_INTERVAL, args.disable_slack, args.print_to_terminal)
+        else:
+            while True:
+                main(config, MONITORING_INTERVAL, args.disable_slack, args.print_to_terminal)
+                time.sleep(args.interval * 60)  # Convert minutes to seconds
+        
     except Exception as e:
-        logging.error(f"Failed to start monitoring service: {str(e)}")
+        logger.error(f"Failed to start monitoring service: {str(e)}")
         exit(1)
