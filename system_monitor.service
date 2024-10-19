@@ -1,0 +1,13 @@
+[Unit]
+Description=System Monitor Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /path/to/your/main.py
+Restart=always
+User=root
+Group=root
+Type=simple
+
+[Install]
+WantedBy=multi-user.target

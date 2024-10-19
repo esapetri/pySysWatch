@@ -1,0 +1,24 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+python-dotenv = "*"
+aiofiles = "*"
+systemd = "*"
+aiosmtplib = "*"
+aiohttp = "*"
+requests = "*"
+
+[dev-packages]
+pytest = "*"
+pytest-asyncio = "*"
+httpx = "*"
+black = "*"
+isort = "*"
+flake8 = "*"
+mypy = "*"
+
+[requires]
+python_version = "3.12"
