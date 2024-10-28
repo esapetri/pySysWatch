@@ -30,7 +30,10 @@ A comprehensive system monitoring service written in Python that tracks various 
    pip install -r requirements.txt
    ```
 
-3. **Copy the Configuration File**
+   TODO add inatalling https://pypi.org/project/cysystemd/ mentioned reguirment = systemdlib-dev
+   in debian apt install build-essential libsystemd-dev
+
+3. **Copy the Configuration File (optional)**
    ```bash
    sudo mkdir -p /etc/system_monitor
    sudo cp config.ini /etc/system_monitor/config.ini

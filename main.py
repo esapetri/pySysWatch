@@ -16,6 +16,7 @@ import sys
 from datetime import datetime, timedelta
 import psutil
 import pytz
+from typing import Dict, Optional
 
 # Add this line near the top of the file, after imports
 global config
@@ -26,6 +27,11 @@ cpu_high_load_start_time = None
 # Add these global variables near the top of the file
 last_disk_usage_report = {}
 last_high_memory_report_time = None
+
+# Add these global variables
+command_monitoring_tasks = {}
+last_command_runs = {}
+
 def parse_arguments():
     parser = argparse.ArgumentParser(description="System Monitoring Service")
     parser.add_argument("-v", "--verbose", action="store_true", help="Increase output verbosity")
@@ -45,14 +51,80 @@ def load_config(config_path):
     config.read(config_path)
     return config
 
-# Main Daemon Function
-def main(config, interval_minutes, disable_slack, print_to_terminal):
-    logger.info("System Monitor Service Started")
-    monitor_disk_space(config, disable_slack, print_to_terminal)
-    monitor_high_cpu_memory(config, disable_slack, print_to_terminal)
-    monitor_journal_events(config, interval_minutes, disable_slack, print_to_terminal)
-    #monitor_service_unit_changes(config, disable_slack, print_to_terminal)
+def parse_filter_expression(expression):
+    """Parse filter expression with AND/OR/NOT operators and quoted strings"""
+    def tokenize(expr):
+        # Handle quoted strings (both single and double quotes)
+        pattern = r'''(?:[^\s"']|"[^"]*"|'[^']*')+'''
+        return re.findall(pattern, expr)
+
+    def clean_token(token):
+        # Remove quotes from quoted strings
+        if (token.startswith('"') and token.endswith('"')) or \
+           (token.startswith("'") and token.endswith("'")):
+            return token[1:-1].strip().lower()
+        return token.strip().lower()
+
+    def create_condition(expr):
+        expr = clean_token(expr)
+        if expr.startswith('not '):
+            inner_expr = clean_token(expr[4:])
+            return lambda m: not inner_expr in m.lower()
+        return lambda m: expr in m.lower()
+
+    expression = expression.strip()
+    if ' or ' in expression:
+        tokens = [t for t in tokenize(expression) if t.lower() != 'or']
+        conditions = [create_condition(t) for t in tokens]
+        return lambda m: any(c(m) for c in conditions)
+    elif ' and ' in expression:
+        tokens = [t for t in tokenize(expression) if t.lower() != 'and']
+        conditions = [create_condition(t) for t in tokens]
+        return lambda m: all(c(m) for c in conditions)
+    else:
+        return create_condition(expression)
+
+def build_event_types(config):
+    event_types = {}
+    for section in config['JournalMonitoring']:
+        if section.endswith('.title'):
+            event_name = section[:-6]
+            title = config['JournalMonitoring'][section]
+            start = config['JournalMonitoring'].get(f'{event_name}.start', '').strip()
+            filters_str = config['JournalMonitoring'].get(f'{event_name}.filters', '').strip()
+
+            def create_condition(filters_str, start):
+                def condition(message):
+                    if start and not message.lower().startswith(start.lower()):
+                        return False
+                    if not filters_str:  # If no filters, only check start condition
+                        return True
+                    return parse_filter_expression(filters_str)(message.lower())
+                return condition
+
+            event_types[event_name] = (title, create_condition(filters_str, start))
     
+    return event_types
+
+# Main Daemon Function
+async def async_main(config, interval_minutes, disable_slack, print_to_terminal):
+    """Async version of main function"""
+    logger.info("System Monitor Service Started")
+    
+    tasks = [
+        monitor_commands(config, disable_slack, print_to_terminal),
+        # Convert existing monitoring functions to coroutines or run them in executor
+        asyncio.to_thread(monitor_disk_space, config, disable_slack, print_to_terminal),
+        asyncio.to_thread(monitor_high_cpu_memory, config, disable_slack, print_to_terminal),
+        asyncio.to_thread(monitor_journal_events, config, interval_minutes, disable_slack, print_to_terminal),
+        #asyncio.to_thread(monitor_service_unit_changes, config, disable_slack, print_to_terminal),
+    ]
+    
+    await asyncio.gather(*tasks)
+
+def main(config, interval_minutes, disable_slack, print_to_terminal):
+    asyncio.run(async_main(config, interval_minutes, disable_slack, print_to_terminal))
+
 # Report to Admin Function
 def report_to_admin(config, subject="NONE", message="error, message missing", disable_slack=False, print_to_terminal=False):
     tasks = []
@@ -80,6 +152,9 @@ def monitor_disk_space(config, disable_slack, print_to_terminal):
     global last_disk_usage_report
     current_time = datetime.now()
     
+    # Get alert frequency from config (in hours), default to 24 hours
+    alert_frequency = timedelta(hours=config.getint('Thresholds', 'DiskAlertFrequency', fallback=24))
+    
     try:
         result = subprocess.run(['df', '-h'], text=True, capture_output=True, check=True)
         lines = result.stdout.splitlines()
@@ -97,7 +172,7 @@ def monitor_disk_space(config, disable_slack, print_to_terminal):
                 continue
             
             disk = parts[0]
-            if disk not in last_disk_usage_report or current_time - last_disk_usage_report[disk] > timedelta(days=1):
+            if disk not in last_disk_usage_report or current_time - last_disk_usage_report[disk] > alert_frequency:
                 report_to_admin(config, f"{report_level} Disk Usage Alert", f"Disk usage at {usage_percent}% on {disk}", disable_slack, print_to_terminal)
                 last_disk_usage_report[disk] = current_time
             
@@ -111,31 +186,17 @@ def monitor_disk_space(config, disable_slack, print_to_terminal):
         logger.warning(f"Unexpected error: {str(e)}")
 
 def monitor_journal_events(config, interval_minutes, disable_slack, print_to_terminal):
+    #https://pypi.org/project/cysystemd/
     if not config.getboolean('Monitoring', 'EnableJournalMonitoring'):
         return
-    keywords = config.get('JournalMonitoring', 'Keywords').split(',')
-    event_types = {
-        #'reboot': ('System Reboot/Shutdown Detected', lambda m: any(kw in m for kw in keywords)),
-        'oom-killer': ('Out of Memory Event Detected', lambda m: 'oom-killer' in m),
-        'hardware error': ('Hardware Issue Detected', lambda m: 'hardware error' in m),
-        'network': ('Network Issue Detected', lambda m: 'network' in m and 'failed' in m),
-        'sudo': ('Sudo Command Executed', lambda m: 'sudo' in m),
-        'service': ('Service Failure Detected', lambda m: 'failed' in m and 'service' in m),
-        'login': ('Login Event Detected', lambda m: 'login' in m),
-        'filesystem error': ('File System Error Detected', lambda m: 'filesystem error' in m),
-        'i/o error': ('Disk I/O Error Detected', lambda m: 'i/o error' in m),
-        'hardware': ('Hardware Change Detected', lambda m: 'new hardware' in m or 'removed hardware' in m),
-        'security alert': ('Security Alert Detected', lambda m: 'security alert' in m),
-        'dependency failed': ('Unit Dependency Failure Detected', lambda m: 'dependency failed' in m),
-        'time sync': ('Time Synchronization Failure Detected', lambda m: 'time sync' in m and 'failed' in m),
-        'power': ('Power Event Detected', lambda m: 'power' in m),
-        'connection': ('Connection Event Detected', lambda m: 'connection' in m.lower() or 'login' in m.lower() or 'connected' in m.lower() or 'disconnected' in m.lower()),
-    }
+
+    # Build event types from config using the new logic
+    event_types = build_event_types(config)
+
     try:
         journal_reader = JournalReader()
         journal_reader.open(JournalOpenMode.SYSTEM)
         
-        # Seek to entries from the last interval
         interval_ago = datetime.now(tz=pytz.UTC) - timedelta(minutes=interval_minutes)
         journal_reader.seek_realtime_usec(int(interval_ago.timestamp() * 1000000))
 
@@ -143,13 +204,19 @@ def monitor_journal_events(config, interval_minutes, disable_slack, print_to_ter
             entry_time = record.date.replace(tzinfo=pytz.UTC)
             if entry_time < interval_ago:
                 continue
-            #print(record.data['MESSAGE'])
 
             if 'MESSAGE' in record.data:
                 message = record.data['MESSAGE'].lower()
+                timestamp = entry_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+                
+                # Get process identifier (SYSLOG_IDENTIFIER or _COMM as fallback)
+                process_name = record.data.get('SYSLOG_IDENTIFIER', 
+                             record.data.get('_COMM', 'unknown'))
+                
                 for event_type, (subject, condition) in event_types.items():
                     if condition(message):
-                        report_to_admin(config, subject, message, disable_slack, print_to_terminal)
+                        formatted_message = f"[{timestamp}] [{process_name}] {message}"
+                        report_to_admin(config, subject, formatted_message, disable_slack, print_to_terminal)
                         break
     except Exception as e:
         logger.warning(f"Error monitoring journal events: {str(e)}")
@@ -159,10 +226,16 @@ def monitor_high_cpu_memory(config, disable_slack, print_to_terminal):
         return
     
     global cpu_high_load_start_time, last_high_memory_report_time
-    cpu_threshold = 90  # Set threshold to 90%
-    duration_threshold = 2 * 60 * 60  # 2 hours in seconds
+    
+    # Get thresholds and alert frequencies from config
+    cpu_threshold = config.getint('Thresholds', 'CPUUsageThreshold', fallback=90)
+    cpu_alert_frequency = timedelta(hours=config.getint('Thresholds', 'CPUAlertFrequency', fallback=2))
+    memory_threshold = config.getint('Thresholds', 'MemoryUsageThreshold', fallback=90)
+    swap_threshold = config.getint('Thresholds', 'SwapUsageThreshold', fallback=85)
+    memory_alert_frequency = timedelta(hours=config.getint('Thresholds', 'MemoryAlertFrequency', fallback=1))
     
     try:
+        # CPU monitoring
         proc = subprocess.run(
             ['ps', '-eo', 'pid,ppid,cmd,%mem,%cpu', '--sort=-%cpu'],
             capture_output=True, text=True
@@ -170,18 +243,24 @@ def monitor_high_cpu_memory(config, disable_slack, print_to_terminal):
         lines = proc.stdout.splitlines()
         total_cpu_usage = sum(float(line.split()[-1]) for line in lines[1:])
         
-        current_time = time.time()
+        current_time = datetime.now()
         
         if total_cpu_usage > cpu_threshold:
             if cpu_high_load_start_time is None:
                 cpu_high_load_start_time = current_time
-            elif current_time - cpu_high_load_start_time > duration_threshold:
-                report_to_admin(config, "Sustained High CPU Usage Alert", 
-                                f"Total CPU usage has been above {cpu_threshold}% for over 2 hours. Current usage: {total_cpu_usage:.2f}%",
-                                disable_slack, print_to_terminal)
+            elif current_time - cpu_high_load_start_time > cpu_alert_frequency:
+                report_to_admin(
+                    config, 
+                    "Sustained High CPU Usage Alert", 
+                    f"Total CPU usage has been above {cpu_threshold}% for over {cpu_alert_frequency.total_hours()} hours. Current usage: {total_cpu_usage:.2f}%",
+                    disable_slack, 
+                    print_to_terminal
+                )
+                cpu_high_load_start_time = current_time  # Reset timer after alert
         else:
             cpu_high_load_start_time = None
 
+        # Memory monitoring
         memory = psutil.virtual_memory()
         swap = psutil.swap_memory()
         total_memory = memory.total + swap.total
@@ -189,19 +268,16 @@ def monitor_high_cpu_memory(config, disable_slack, print_to_terminal):
         total_memory_percent = (used_memory / total_memory) * 100
         swap_percent = swap.percent
 
-        memory_threshold = config.getint('Thresholds', 'MemoryUsageThreshold', fallback=90)
-        swap_threshold = config.getint('Thresholds', 'SwapUsageThreshold', fallback=85)
-
-        current_datetime = datetime.now()
         if (total_memory_percent >= memory_threshold or swap_percent >= swap_threshold) and \
-           (last_high_memory_report_time is None or current_datetime - last_high_memory_report_time > timedelta(hours=1)):
+           (last_high_memory_report_time is None or current_time - last_high_memory_report_time > memory_alert_frequency):
             message = f"High memory usage detected. Total memory (including swap) usage: {total_memory_percent:.2f}%, Swap usage: {swap_percent:.2f}%"
             report_to_admin(config, "High Memory Usage Alert", message, disable_slack, print_to_terminal)
-            last_high_memory_report_time = current_datetime
+            last_high_memory_report_time = current_time
 
     except Exception as e:
         logger.error(f"Error monitoring CPU/memory usage: {str(e)}")
 
+#FIXME broken and not in use
 def monitor_service_unit_changes(config, disable_slack, print_to_terminal):
     if not config.getboolean('Monitoring', 'EnableServiceUnitMonitoring'):
         return
@@ -238,6 +314,114 @@ def handle_exit_signal(signum, frame):
 signal.signal(signal.SIGINT, handle_exit_signal)
 signal.signal(signal.SIGTERM, handle_exit_signal)
 
+# Add this new function
+async def monitor_commands(config: Dict, disable_slack: bool, print_to_terminal: bool) -> None:
+    """Monitor system commands defined in config."""
+    if not config.getboolean('CommandMonitoring', 'EnableCommandMonitoring', fallback=False):
+        return
+
+    global command_monitoring_tasks, last_command_runs
+    current_time = time.time()
+
+    async def run_command(name: str, cmd_config: Dict) -> None:
+        # Check if command exists first
+        base_cmd = cmd_config['cmd'].split()[0]
+        if not await check_command_exists(base_cmd):
+            logger.warning(f"Command '{base_cmd}' not found on system. Monitoring for '{name}' disabled.")
+            return
+
+        while True:
+            try:
+                # Check if it's time to run
+                current_time = time.time()
+                if name in last_command_runs:
+                    time_since_last_run = current_time - last_command_runs[name]
+                    if time_since_last_run < int(cmd_config['interval']):
+                        await asyncio.sleep(1)
+                        continue
+
+                # Run command
+                process = await asyncio.create_subprocess_shell(
+                    cmd_config['cmd'],
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+
+                if process.returncode != 0:
+                    logger.warning(f"Command '{name}' failed with return code {process.returncode}")
+                    await asyncio.sleep(int(cmd_config['interval']))
+                    continue
+
+                output = stdout.decode().strip()
+
+                # Update last run time
+                last_command_runs[name] = time.time()
+
+                # Check pattern and format output
+                if 'pattern' in cmd_config:
+                    match = re.search(cmd_config['pattern'], output)
+                    if match:
+                        if 'format' in cmd_config:
+                            # Use match.group(1) instead of match.groups()
+                            message = cmd_config['format'].format(match=[match.group(1)])
+                        else:
+                            message = f"{name}: {match.group(0)}"
+
+                        # Send alert
+                        is_critical = cmd_config.get('critical', 'false').lower() == 'true'
+                        await asyncio.to_thread(
+                            report_to_admin,
+                            config,
+                            f"Command Monitor: {name}",
+                            message,
+                            disable_slack,
+                            print_to_terminal
+                        )
+
+                await asyncio.sleep(int(cmd_config['interval']))
+
+            except FileNotFoundError:
+                logger.warning(f"Command for '{name}' not found. Disabling this monitor.")
+                return
+            except Exception as e:
+                logger.error(f"Command monitoring error - {name}: {str(e)}")
+                await asyncio.sleep(60)
+
+    # Parse commands from config
+    for key in config['CommandMonitoring']:
+        if key.endswith('.cmd'):
+            cmd_name = key[:-4]
+            cmd_config = {
+                'cmd': config['CommandMonitoring'][f'{cmd_name}.cmd'],
+                'interval': config['CommandMonitoring'].get(f'{cmd_name}.interval', '300'),
+                'pattern': config['CommandMonitoring'].get(f'{cmd_name}.pattern'),
+                'format': config['CommandMonitoring'].get(f'{cmd_name}.format'),
+                'critical': config['CommandMonitoring'].get(f'{cmd_name}.critical', 'false')
+            }
+            
+            # Create task if not already running
+            if cmd_name not in command_monitoring_tasks:
+                command_monitoring_tasks[cmd_name] = asyncio.create_task(
+                    run_command(cmd_name, cmd_config)
+                )
+
+# Add this helper function at the top level
+async def check_command_exists(cmd: str) -> bool:
+    """Check if a command exists on the system."""
+    try:
+        # Use 'which' command to check if the command exists
+        process = await asyncio.create_subprocess_shell(
+            f"which {cmd}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        return process.returncode == 0
+    except Exception:
+        return False
+
+# Update the main execution block
 if __name__ == "__main__":
     args = parse_arguments()
     
