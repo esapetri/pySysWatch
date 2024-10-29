@@ -12,6 +12,7 @@ aiohttp = "*"
 requests = "*"
 pytz = "*"
 psutil = "*"
+sympy = "*"
 
 [dev-packages]
 pytest = "*"

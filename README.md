@@ -1,21 +1,51 @@
-# System Monitoring Service
+# pySysWatch System Monitoring Service
 
-A comprehensive system monitoring service written in Python that tracks various system metrics and sends alerts when thresholds are exceeded.
+A system monitoring service written in Python that tracks various system metrics and sends alerts when thresholds are exceeded.
 
 ## Features
 
-- Disk space monitoring
-- CPU and memory usage monitoring
-- System journal event monitoring
-- Service unit file change detection
-- Configurable alert thresholds
-- Email and Slack notifications
+- **System Monitoring**
+  - Disk space usage and alerts
+  - CPU and memory utilization tracking
+  - Swap usage monitoring
+  - System journal event monitoring
+  - Service unit file change detection
+  
+- **Alert Mechanisms**
+  - Email notifications
+  - Slack integration
+  - Terminal output option
+  - Configurable alert thresholds
+  - Customizable alert frequencies
+
+- **Journal Event Monitoring**
+  - System boot/shutdown events
+  - Out of memory incidents
+  - Hardware errors
+  - Network issues
+  - Security events
+  - Service failures
+  - Login attempts
+  - And many more...
+
+- **Command Monitoring**
+  - Periodic command execution
+  - Pattern matching on command output
+  - Configurable execution intervals
+  - Critical alert flagging
 
 ## Prerequisites
 
 - Python 3.7+
-- pip (Python package manager)
-- systemd (for running as a service)
+- systemd
+- Required system packages:
+  ```bash
+  # Debian/Ubuntu
+  sudo apt install build-essential libsystemd-dev
+
+  # RHEL/CentOS
+  sudo dnf install gcc systemd-devel
+  ```
 
 ## Installation
 
@@ -25,116 +55,134 @@ A comprehensive system monitoring service written in Python that tracks various 
    cd system-monitoring-service
    ```
 
-2. **Install the Required Python Packages**
+2. **Set Up Python Environment**
    ```bash
+   # Using pipenv (recommended)
+   pipenv install
+
+   # Or using pip
    pip install -r requirements.txt
    ```
 
-   TODO add inatalling https://pypi.org/project/cysystemd/ mentioned reguirment = systemdlib-dev
-   in debian apt install build-essential libsystemd-dev
-
-3. **Copy the Configuration File (optional)**
+3. **Configure the Service**
    ```bash
    sudo mkdir -p /etc/system_monitor
    sudo cp config.ini /etc/system_monitor/config.ini
-   ```
-
-4. **Edit the Configuration File**
-   ```bash
    sudo nano /etc/system_monitor/config.ini
    ```
 
-## Running the Application
+## Configuration
 
-There are several ways to run this monitoring application:
+The `config.ini` file contains all configuration options:
 
-### 1. As a Python Script
+- **Monitoring Settings**
+  - Enable/disable specific monitoring features
+  - Set thresholds for alerts
+  - Configure monitoring intervals
 
-Run the script directly using Python:
+- **Alert Settings**
+  - Email configuration (SMTP settings)
+  - Slack webhook URL
+  - Alert frequencies
+
+- **Journal Monitoring**
+  - Customizable event filters
+  - Pattern matching rules
+  - Event categorization
+
+- **Command Monitoring**
+  - Define commands to run
+  - Set execution intervals
+  - Configure output parsing
+
+## Usage
+
+### Command Line Options
+
 ```bash
-python main.py
+python main.py [OPTIONS]
+
+Options:
+  -v, --verbose           Increase output verbosity
+  -c, --config PATH       Path to config file (default: /etc/system_monitor/config.ini)
+  --disable-slack         Disable Slack alerts
+  -i, --interval MINUTES  Monitoring interval (default: 5)
+  --run-once             Run once and exit
+  --print-to-terminal    Print alerts to terminal
 ```
 
-Use command-line arguments for additional options:
-- `-v` or `--verbose`: Increase output verbosity
-- `-c` or `--config`: Specify a custom config file path
-- `--disable-slack`: Disable Slack alerts
-- `-i` or `--interval`: Set the monitoring interval in minutes (default: 5)
-- `--run-once`: Run the monitoring once and exit
-- `--print-to-terminal`: Print alerts to terminal
+### Running as a Service
 
-Example:
-```bash
-python main.py -v -c /path/to/custom/config.ini --interval 10 --print-to-terminal
-```
-
-### 2. As a Systemd Service
-
-1. **Copy the Service File**
+1. **Install the Service**
    ```bash
    sudo cp system_monitor.service /etc/systemd/system/
-   ```
-
-2. **Reload the Systemd Manager**
-   ```bash
    sudo systemctl daemon-reload
    ```
 
-3. **Start the Service**
+2. **Start and Enable**
    ```bash
    sudo systemctl start system_monitor
-   ```
-
-4. **Enable the Service to Start on Boot**
-   ```bash
    sudo systemctl enable system_monitor
    ```
 
-5. **Check the Status of the Service**
+3. **Monitor Status**
    ```bash
    sudo systemctl status system_monitor
+   sudo journalctl -u system_monitor -f
    ```
 
-### 3. Using Docker
+### Docker Support
 
-If you prefer to run the application in a container, you can use Docker:
+```bash
+# Build
+docker build -t system-monitor .
 
-1. **Build the Docker Image**
-   ```bash
-   docker build -t system-monitor .
-   ```
-
-2. **Run the Container**
-   ```bash
-   docker run -d --name system-monitor \
-     -v /path/to/config.ini:/etc/system_monitor/config.ini \
-     -v /var/log:/var/log \
-     --privileged \
-     system-monitor
-   ```
-
-   Note: The `--privileged` flag is required to access system information. Use with caution in production environments.
+# Run
+docker run -d \
+  --name system-monitor \
+  -v /path/to/config.ini:/etc/system_monitor/config.ini \
+  -v /var/log:/var/log \
+  --privileged \
+  system-monitor
+```
 
 ## Logging
 
-Logs are written to the file specified in the `config.ini` file. By default, this is `/var/log/system_monitor.log`. You can view the logs using:
+- Default log location: `/var/log/system_monitor.log`
+- Configurable log rotation
+- Supports different log levels (DEBUG, INFO, WARNING, ERROR)
+
 ```bash
+# View logs
 tail -f /var/log/system_monitor.log
+
+# View service logs
+journalctl -u system_monitor -f
 ```
 
 ## Troubleshooting
 
-If you encounter any issues:
+1. **Permission Issues**
+   - Ensure proper permissions for log directory
+   - Check systemd service user permissions
 
-1. Check the log file for error messages.
-2. Verify that the configuration file is correctly set up.
-3. Ensure that the script has the necessary permissions to access system information.
+2. **Configuration Problems**
+   - Validate config.ini syntax
+   - Check log file for configuration errors
+
+3. **Missing Dependencies**
+   - Verify all system packages are installed
+   - Check Python package installation
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+1. Fork the repository
+2. Create a feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a Pull Request
 
 ## License
 
-This project is licensed under the Unlicence License - see the LICENSE file for details.
+This project is released into the public domain under the Unlicense - see the [LICENSE](LICENSE) file for details.
 
