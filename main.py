@@ -115,13 +115,14 @@ def monitor_journal_events(config, interval_minutes, disable_slack, print_to_ter
         return
     keywords = config.get('JournalMonitoring', 'Keywords').split(',')
     event_types = {
-        #'reboot': ('System Reboot/Shutdown Detected', lambda m: any(kw in m for kw in keywords)),
         'oom-killer': ('Out of Memory Event Detected', lambda m: 'oom-killer' in m),
         'hardware error': ('Hardware Issue Detected', lambda m: 'hardware error' in m),
         'network': ('Network Issue Detected', lambda m: 'network' in m and 'failed' in m),
         'sudo': ('Sudo Command Executed', lambda m: 'sudo' in m),
         'service': ('Service Failure Detected', lambda m: 'failed' in m and 'service' in m),
-        'login': ('Login Event Detected', lambda m: 'login' in m),
+        'login': ('Login Event Detected', lambda m: ('login' in m and 'oslogin_cache_refresh' not in m) or 
+                                                   'sshd' in m and 'accepted publickey' in m or
+                                                   'systemd-logind' in m),
         'filesystem error': ('File System Error Detected', lambda m: 'filesystem error' in m),
         'i/o error': ('Disk I/O Error Detected', lambda m: 'i/o error' in m),
         'hardware': ('Hardware Change Detected', lambda m: 'new hardware' in m or 'removed hardware' in m),
@@ -129,7 +130,6 @@ def monitor_journal_events(config, interval_minutes, disable_slack, print_to_ter
         'dependency failed': ('Unit Dependency Failure Detected', lambda m: 'dependency failed' in m),
         'time sync': ('Time Synchronization Failure Detected', lambda m: 'time sync' in m and 'failed' in m),
         'power': ('Power Event Detected', lambda m: 'power' in m),
-        #'connection': ('Connection Event Detected', lambda m: 'connection' in m.lower() or 'login' in m.lower() or 'connected' in m.lower() or 'disconnected' in m.lower()),
     }
     try:
         journal_reader = JournalReader()
@@ -160,25 +160,32 @@ def monitor_high_cpu_memory(config, disable_slack, print_to_terminal):
     
     global cpu_high_load_start_time, last_high_memory_report_time
     cpu_threshold = 90  # Set threshold to 90%
-    duration_threshold = 2 * 60 * 60  # 2 hours in seconds
+    duration_threshold = 24 * 60 * 60  # 24 hours in seconds
     
     try:
-        proc = subprocess.run(
-            ['ps', '-eo', 'pid,ppid,cmd,%mem,%cpu', '--sort=-%cpu'],
-            capture_output=True, text=True
-        )
-        lines = proc.stdout.splitlines()
-        total_cpu_usage = sum(float(line.split()[-1]) for line in lines[1:])
+        # Get CPU usage per core
+        cpu_count = psutil.cpu_count()
+        cpu_percent = psutil.cpu_percent(interval=1, percpu=True)
+        avg_cpu_usage = sum(cpu_percent) / cpu_count
         
         current_time = time.time()
         
-        if total_cpu_usage > cpu_threshold:
+        if avg_cpu_usage > cpu_threshold:
             if cpu_high_load_start_time is None:
                 cpu_high_load_start_time = current_time
             elif current_time - cpu_high_load_start_time > duration_threshold:
-                report_to_admin(config, "Sustained High CPU Usage Alert", 
-                                f"Total CPU usage has been above {cpu_threshold}% for over 2 hours. Current usage: {total_cpu_usage:.2f}%",
-                                disable_slack, print_to_terminal)
+                # Create detailed CPU usage message
+                cpu_details = [f"Core {i}: {usage:.1f}%" for i, usage in enumerate(cpu_percent)]
+                cpu_info = "\n".join(cpu_details)
+                message = (
+                    f"Average CPU usage across all cores has been above {cpu_threshold}% "
+                    f"for over 24 hours.\nCurrent average: {avg_cpu_usage:.1f}%\n"
+                    f"Per-core usage:\n{cpu_info}"
+                )
+                report_to_admin(config, "Sustained High CPU Usage Alert", message,
+                              disable_slack, print_to_terminal)
+                # Reset the timer after sending alert
+                cpu_high_load_start_time = None
         else:
             cpu_high_load_start_time = None
 
