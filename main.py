@@ -129,7 +129,7 @@ def monitor_journal_events(config, interval_minutes, disable_slack, print_to_ter
         'dependency failed': ('Unit Dependency Failure Detected', lambda m: 'dependency failed' in m),
         'time sync': ('Time Synchronization Failure Detected', lambda m: 'time sync' in m and 'failed' in m),
         'power': ('Power Event Detected', lambda m: 'power' in m),
-        'connection': ('Connection Event Detected', lambda m: 'connection' in m.lower() or 'login' in m.lower() or 'connected' in m.lower() or 'disconnected' in m.lower()),
+        #'connection': ('Connection Event Detected', lambda m: 'connection' in m.lower() or 'login' in m.lower() or 'connected' in m.lower() or 'disconnected' in m.lower()),
     }
     try:
         journal_reader = JournalReader()
