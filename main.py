@@ -119,14 +119,44 @@ def monitor_journal_events(config, interval_minutes, disable_slack, print_to_ter
         'hardware error': ('Hardware Issue Detected', lambda m: 'hardware error' in m),
         'network': ('Network Issue Detected', lambda m: 'network' in m and 'failed' in m),
         'sudo': ('Sudo Command Executed', lambda m: 'sudo' in m),
-        'service': ('Service Failure Detected', lambda m: 'failed' in m and 'service' in m),
-        'login': ('Login Event Detected', lambda m: ('login' in m and 'oslogin_cache_refresh' not in m) or 
-                                                   'sshd' in m and 'accepted publickey' in m or
-                                                   'systemd-logind' in m),
+        'service': ('Service Status Change Detected', lambda m: ('failed' in m or 'deactivated' in m) and 'service' in m),
+        'service_deactivation': ('Service Deactivation Detected', lambda m: 'deactivated successfully' in m or 'stopped' in m),
+        'login': ('Login Event Detected', lambda m: any([
+            'accepted publickey' in m and 'sshd' in m,  # SSH key acceptance
+            'accepted password' in m and 'sshd' in m,  # Password login
+            'session opened for user' in m and 'pam_unix(sshd:session)' in m,  # PAM session opening
+            'new session' in m and 'systemd-logind' in m,  # systemd-logind new session
+            'started session' in m and 'systemd' in m and 'user' in m.lower()  # systemd session start
+        ])),
         'filesystem error': ('File System Error Detected', lambda m: 'filesystem error' in m),
         'i/o error': ('Disk I/O Error Detected', lambda m: 'i/o error' in m),
         'hardware': ('Hardware Change Detected', lambda m: 'new hardware' in m or 'removed hardware' in m),
         'security alert': ('Security Alert Detected', lambda m: 'security alert' in m),
+        'system_state': ('System State Change Detected', lambda m: any([
+            'kernel: panic' in m.lower(),  # Kernel panic
+            'emergency shutdown' in m.lower(),  # Emergency shutdown
+            'system is rebooting' in m.lower(),  # System reboot
+            'starting system' in m and 'systemd' in m,  # System startup
+            'shutting down system' in m and 'systemd' in m  # System shutdown
+        ])),
+        'process_error': ('Process Error Detected', lambda m: any([
+            'segfault' in m.lower(),  # Segmentation faults
+            'process timed out' in m.lower(),  # Process timeouts
+            'process killed' in m and 'oom' not in m.lower(),  # Process killed (not OOM)
+            'core dumped' in m.lower()  # Core dumps
+        ])),
+        'security_event': ('Security Event Detected', lambda m: any([
+            'permission denied' in m.lower() and 'sshd' not in m,  # Permission denied (not SSH)
+            'firewall block' in m.lower(),  # Firewall blocks
+            'unattended-upgrade' in m and 'security' in m  # Security updates
+            #'authentication failure' in m and 'sudo' not in m  # Auth failures (not sudo)
+        ])),
+        'critical_service': ('Critical Service Event Detected', lambda m: any([
+            'emergency mode' in m.lower(),  # Emergency mode
+            'dependency failed' in m and 'systemd' in m,  # Systemd dependency failures
+            'failed with result' in m and 'systemd' in m,  # Service failures
+            'core service' in m.lower() and 'failed' in m  # Core service issues
+        ])),
         'dependency failed': ('Unit Dependency Failure Detected', lambda m: 'dependency failed' in m),
         'time sync': ('Time Synchronization Failure Detected', lambda m: 'time sync' in m and 'failed' in m),
         'power': ('Power Event Detected', lambda m: 'power' in m),
