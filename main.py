@@ -119,8 +119,8 @@ def monitor_journal_events(config, interval_minutes, disable_slack, print_to_ter
         'hardware error': ('Hardware Issue Detected', lambda m: 'hardware error' in m),
         'network': ('Network Issue Detected', lambda m: 'network' in m and 'failed' in m),
         'sudo': ('Sudo Command Executed', lambda m: 'sudo' in m),
-        'service': ('Service Status Change Detected', lambda m: ('failed' in m or 'deactivated' in m) and 'service' in m),
-        'service_deactivation': ('Service Deactivation Detected', lambda m: 'deactivated successfully' in m or 'stopped' in m),
+#        'service': ('Service Status Change Detected', lambda m: ('failed' in m or 'deactivated' in m) and 'service' in m),
+#        'service_deactivation': ('Service Deactivation Detected', lambda m: 'deactivated successfully' in m or 'stopped' in m),
         'login': ('Login Event Detected', lambda m: any([
             'accepted publickey' in m and 'sshd' in m,  # SSH key acceptance
             'accepted password' in m and 'sshd' in m,  # Password login
