@@ -21,6 +21,7 @@ from cysystemd.reader import JournalReader, JournalOpenMode
 from systemd import journal as systemd_journal
 from sympy.parsing.sympy_parser import parse_expr
 from sympy import Symbol
+import requests
 
 # Local imports
 from integrations.send_email import send_email
@@ -35,6 +36,11 @@ last_disk_usage_report = {}
 last_high_memory_report_time = None
 command_monitoring_tasks = {}
 last_command_runs = {}
+# Track the last journal timestamp processed to avoid duplicate alerts
+last_journal_timestamp = 0
+
+# Cache IP information for geolocation lookups
+ip_cache: Dict[str, str] = {}
 logger = None
 
 def parse_arguments():
@@ -123,6 +129,25 @@ def evaluate_filter_with_sympy(filter_str: str, event_text: str, debug: bool = F
             print(f"Error parsing filter '{filter_str}': {e}")
             print(f"Event text: {event_text}")
         return False
+
+
+def get_ip_details(ip: str) -> str:
+    """Return IP with basic geolocation info."""
+    if ip in ip_cache:
+        return ip_cache[ip]
+    try:
+        resp = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            country = data.get("country", "")
+            org = data.get("org", "")
+            info = f"{ip} ({country} {org})".strip()
+            ip_cache[ip] = info
+            return info
+    except Exception as e:
+        logger.debug(f"IP lookup failed for {ip}: {e}")
+    ip_cache[ip] = ip
+    return ip
 
 async def monitor_commands(config: Dict, disable_slack: bool, print_to_terminal: bool) -> None:
     logger.debug("Starting command monitoring")
@@ -400,32 +425,48 @@ def monitor_journal_events(config, interval_minutes, disable_slack, print_to_ter
     
     logger.debug(f"Loaded filters: {list(filters.keys())}")
 
+    global last_journal_timestamp
+
     try:
         journal_reader = JournalReader()
         journal_reader.open(JournalOpenMode.SYSTEM)
-        
-        interval_ago = datetime.now(tz=pytz.UTC) - timedelta(minutes=interval_minutes)
-        cutoff_usec = int(interval_ago.timestamp() * 1_000_000)
-        journal_reader.seek_realtime_usec(cutoff_usec)
+
+        if last_journal_timestamp:
+            journal_reader.seek_realtime_usec(last_journal_timestamp + 1)
+            cutoff_usec = last_journal_timestamp
+        else:
+            interval_ago = datetime.now(tz=pytz.UTC) - timedelta(minutes=interval_minutes)
+            cutoff_usec = int(interval_ago.timestamp() * 1_000_000)
+            journal_reader.seek_realtime_usec(cutoff_usec)
         
         for record in journal_reader:
             entry_usec = record.get_realtime_usec()
-            if entry_usec < cutoff_usec:
+            if entry_usec <= cutoff_usec:
                 continue
+
+            last_journal_timestamp = max(last_journal_timestamp, entry_usec)
 
             if 'MESSAGE' in record.data:
                 message = record.data['MESSAGE']
                 timestamp = datetime.fromtimestamp(entry_usec / 1_000_000).strftime("%Y-%m-%d %H:%M:%S %Z")
                 process_name = record.data.get('SYSLOG_IDENTIFIER', record.data.get('_COMM', 'unknown'))
-                
+
                 # Test message against each filter
                 for event_name, filter_data in filters.items():
                     matches = {}
                     if evaluate_filter_with_sympy(filter_data['filter'], message, matches=matches):
-                        formatted_message = f"[{timestamp}] [{process_name}] {message}"
+                        if event_name == 'login':
+                            ip_match = re.search(r'(?:from|rhost=)\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})', message)
+                            ip_info = ''
+                            if ip_match:
+                                ip_info = ' ' + get_ip_details(ip_match.group(1))
+                            formatted_message = f"[{timestamp}] [{process_name}] {message}{ip_info}"
+                        else:
+                            formatted_message = f"[{timestamp}] [{process_name}] {message}"
+
                         report_to_admin(
                             config,
-                            f"Journal Event: {filter_data['title']}", 
+                            f"Journal Event: {filter_data['title']}",
                             formatted_message,
                             disable_slack,
                             print_to_terminal
@@ -528,55 +569,3 @@ if __name__ == "__main__":
             print(f"Failed to start monitoring service: {str(e)}")
         exit(1)
 
-def monitor_journal_events(config, interval_minutes, disable_slack, print_to_terminal):
-    logger.debug("Starting journal event monitoring")
-    if not config.getboolean('Monitoring', 'EnableJournalMonitoring'):
-        logger.debug("Journal monitoring disabled in config")
-        return
-
-    # Load filters from config
-    filters = {
-        key.replace('.filters', ''): {
-            'title': config['JournalMonitoring'].get(f'{key.replace(".filters", "")}.title', key),
-            'filter': config['JournalMonitoring'][key]
-        }
-        for key in config['JournalMonitoring']
-        if key.endswith('.filters')
-    }
-    
-    logger.debug(f"Loaded filters: {list(filters.keys())}")
-
-    try:
-        journal_reader = JournalReader()
-        journal_reader.open(JournalOpenMode.SYSTEM)
-        
-        interval_ago = datetime.now(tz=pytz.UTC) - timedelta(minutes=interval_minutes)
-        cutoff_usec = int(interval_ago.timestamp() * 1_000_000)
-        journal_reader.seek_realtime_usec(cutoff_usec)
-        
-        for record in journal_reader:
-            entry_usec = record.get_realtime_usec()
-            if entry_usec < cutoff_usec:
-                continue
-
-            if 'MESSAGE' in record.data:
-                message = record.data['MESSAGE']
-                timestamp = datetime.fromtimestamp(entry_usec / 1_000_000).strftime("%Y-%m-%d %H:%M:%S %Z")
-                process_name = record.data.get('SYSLOG_IDENTIFIER', record.data.get('_COMM', 'unknown'))
-                
-                # Test message against each filter
-                for event_name, filter_data in filters.items():
-                    matches = {}
-                    if evaluate_filter_with_sympy(filter_data['filter'], message, matches=matches):
-                        formatted_message = f"[{timestamp}] [{process_name}] {message}"
-                        report_to_admin(
-                            config,
-                            f"Journal Event: {filter_data['title']}", 
-                            formatted_message,
-                            disable_slack,
-                            print_to_terminal
-                        )
-                        break
-
-    except Exception as e:
-        logger.error(f"Error monitoring journal events: {str(e)}", exc_info=True)
