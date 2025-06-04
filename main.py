@@ -327,7 +327,7 @@ def monitor_high_cpu_memory(config, disable_slack, print_to_terminal):
                 report_to_admin(
                     config, 
                     "Sustained High CPU Usage Alert", 
-                    f"Total CPU usage has been above {cpu_threshold}% for over {cpu_alert_frequency.total_hours()} hours. Current usage: {total_cpu_usage:.2f}%",
+                    f"Total CPU usage has been above {cpu_threshold}% for over {cpu_alert_frequency.total_seconds() / 3600:.1f} hours. Current usage: {total_cpu_usage:.2f}%",
                     disable_slack, 
                     print_to_terminal
                 )
@@ -528,55 +528,3 @@ if __name__ == "__main__":
             print(f"Failed to start monitoring service: {str(e)}")
         exit(1)
 
-def monitor_journal_events(config, interval_minutes, disable_slack, print_to_terminal):
-    logger.debug("Starting journal event monitoring")
-    if not config.getboolean('Monitoring', 'EnableJournalMonitoring'):
-        logger.debug("Journal monitoring disabled in config")
-        return
-
-    # Load filters from config
-    filters = {
-        key.replace('.filters', ''): {
-            'title': config['JournalMonitoring'].get(f'{key.replace(".filters", "")}.title', key),
-            'filter': config['JournalMonitoring'][key]
-        }
-        for key in config['JournalMonitoring']
-        if key.endswith('.filters')
-    }
-    
-    logger.debug(f"Loaded filters: {list(filters.keys())}")
-
-    try:
-        journal_reader = JournalReader()
-        journal_reader.open(JournalOpenMode.SYSTEM)
-        
-        interval_ago = datetime.now(tz=pytz.UTC) - timedelta(minutes=interval_minutes)
-        cutoff_usec = int(interval_ago.timestamp() * 1_000_000)
-        journal_reader.seek_realtime_usec(cutoff_usec)
-        
-        for record in journal_reader:
-            entry_usec = record.get_realtime_usec()
-            if entry_usec < cutoff_usec:
-                continue
-
-            if 'MESSAGE' in record.data:
-                message = record.data['MESSAGE']
-                timestamp = datetime.fromtimestamp(entry_usec / 1_000_000).strftime("%Y-%m-%d %H:%M:%S %Z")
-                process_name = record.data.get('SYSLOG_IDENTIFIER', record.data.get('_COMM', 'unknown'))
-                
-                # Test message against each filter
-                for event_name, filter_data in filters.items():
-                    matches = {}
-                    if evaluate_filter_with_sympy(filter_data['filter'], message, matches=matches):
-                        formatted_message = f"[{timestamp}] [{process_name}] {message}"
-                        report_to_admin(
-                            config,
-                            f"Journal Event: {filter_data['title']}", 
-                            formatted_message,
-                            disable_slack,
-                            print_to_terminal
-                        )
-                        break
-
-    except Exception as e:
-        logger.error(f"Error monitoring journal events: {str(e)}", exc_info=True)
